@@ -235,6 +235,38 @@ func getVersionLibs(logger logger.Interface, driver *root.Driver, version string
 		return nil, "", fmt.Errorf("failed to locate libraries for driver version %v: %v", version, err)
 	}
 
+	// List of explicit libraries to locate
+	// TODO(ArangoGutierrez): we should load the version of the libraries from
+	// the sandboxutils-filelist.
+	explicitLibraryNames := []string{
+		"libEGL.so.1.1.0",
+		"libGL.so.1.7.0",
+		"libGLESv1_CM.so.1.2.0",
+		"libGLESv2.so.2.1.0",
+		"libGLX.so.0",
+		"libGLdispatch.so.0",
+		"libOpenCL.so.1.0.0",
+		"libOpenGL.so.0",
+		"libnvidia-api.so.1",
+		"libnvidia-egl-xcb.so.1.0.0",
+		"libnvidia-egl-xlib.so.1.0.0",
+	}
+
+	// Locate each explicit library
+	var explicitLibs []string
+	for _, libName := range explicitLibraryNames {
+		found, err := libraries.Locate(libName)
+		if err != nil {
+			// Log warning but continue with other libraries
+			logger.Warningf("failed to locate library %s: %v", libName, err)
+			continue
+		}
+		explicitLibs = append(explicitLibs, found...)
+	}
+
+	// Append explicit libraries to the main libs list
+	libs = append(libs, explicitLibs...)
+
 	if driver.Root == "/" || driver.Root == "" {
 		return libs, libCudaDirectoryPath, nil
 	}
