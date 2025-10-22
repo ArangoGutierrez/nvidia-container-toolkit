@@ -19,6 +19,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -50,28 +51,25 @@ exit 1
 
 // containerdTestEnv defines the test environment for different containerd versions
 type containerdTestEnv struct {
-	name              string
-	image             string
-	configVersion     int
-	pluginPath        string
-	hasDefaultImports bool
+	name          string
+	image         string
+	configVersion int64
+	pluginPath    string
 }
 
 // Define both containerd versions to test
 var containerdEnvs = []containerdTestEnv{
 	{
-		name:              "containerd-1.7",
-		image:             "kindest/node:v1.30.0@sha256:047357ac0cfea04663786a612ba1eaba9702bef25227a794b52890dd8bcd692e",
-		configVersion:     2,
-		pluginPath:        "io.containerd.grpc.v1.cri",
-		hasDefaultImports: false,
+		name:          "containerd-1.7",
+		image:         "kindest/node:v1.30.0@sha256:047357ac0cfea04663786a612ba1eaba9702bef25227a794b52890dd8bcd692e",
+		configVersion: 2,
+		pluginPath:    "io.containerd.grpc.v1.cri",
 	},
 	{
-		name:              "containerd-2.1",
-		image:             "docker.io/kindest/base:v20250521-31a79fd4",
-		configVersion:     3,
-		pluginPath:        "io.containerd.cri.v1.runtime",
-		hasDefaultImports: true,
+		name:          "containerd-2.1",
+		image:         "docker.io/kindest/base:v20250521-31a79fd4",
+		configVersion: 3,
+		pluginPath:    "io.containerd.cri.v1.runtime",
 	},
 }
 
@@ -79,12 +77,12 @@ var containerdEnvs = []containerdTestEnv{
 var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runtime"), func() {
 	// Run all tests for each containerd version
 	for _, env := range containerdEnvs {
-		env := env // capture loop variable
-
-		Context(fmt.Sprintf("with %s", env.name), Ordered, func() {
+		Context(env.name, Ordered, func() {
 			var (
-				nestedContainerRunner Runner
-				containerName         = fmt.Sprintf("nvctk-e2e-containerd-%s-tests", env.name)
+				nestedContainerRunner          Runner
+				containerName                  = "nvctk-e2e-containerd-tests-" + env.name
+				originalTopLevelConfigContents string
+				// originalTopLevelConfigToml     *toml.Tree
 			)
 
 			// ensureContainerdRunning starts containerd if not running and waits for it to be ready
@@ -124,7 +122,15 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 				var err error
 
 				// Create the nested container with the global cache mounted
-				nestedContainerRunner, err = NewNestedContainerRunner(runner, env.image, installCTK, containerName, localCacheDir)
+				// TODO: This runner doesn't actually NEED GPU access.
+				nestedContainerRunner, err = NewNestedContainerRunner(runner, env.image, false, containerName, localCacheDir)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Store the contents of the original config.
+				originalTopLevelConfigContents, _, err = nestedContainerRunner.Run("cat /etc/containerd/config.toml")
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = toml.Load(originalTopLevelConfigContents)
 				Expect(err).ToNot(HaveOccurred())
 
 				// Backup original containerd configuration
@@ -133,7 +139,7 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 			if [ -d /etc/containerd/conf.d ]; then
 				cp -r /etc/containerd/conf.d /tmp/containerd-conf.d.backup
 			fi
-			
+
 			# Backup the original config.toml
 			if [ -f /etc/containerd/config.toml ]; then
 				cp /etc/containerd/config.toml /tmp/containerd-config.toml.backup
@@ -174,7 +180,7 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 				rm -rf /etc/containerd/conf.d
 				mkdir -p /etc/containerd/conf.d
 			fi
-			
+
 			# Restore the original config.toml
 			if [ -f /tmp/containerd-config.toml.backup ]; then
 				cp /tmp/containerd-config.toml.backup /etc/containerd/config.toml
@@ -196,12 +202,16 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					_, _, err := nestedContainerRunner.Run(`nvidia-ctk runtime configure --runtime=containerd --config=/etc/containerd/config.toml --drop-in-config=/etc/containerd/conf.d/99-nvidia.toml --set-as-default --cdi.enabled`)
 					Expect(err).ToNot(HaveOccurred(), "Failed to configure containerd")
 
-					// For containerd 1.7, verify nvidia-ctk added imports directive to main config
-					if !env.hasDefaultImports {
-						output, _, err := nestedContainerRunner.Run(`grep "^imports" /etc/containerd/config.toml`)
-						Expect(err).ToNot(HaveOccurred(), "nvidia-ctk should have added imports directive to main config")
-						Expect(output).To(ContainSubstring(`imports = ["/etc/containerd/conf.d/*.toml"]`))
-					}
+					topLevelConfigContents, _, err := nestedContainerRunner.Run("cat /etc/containerd/config.toml")
+					Expect(err).ToNot(HaveOccurred())
+
+					_, err = toml.Load(topLevelConfigContents)
+					Expect(err).ToNot(HaveOccurred())
+
+					dropInConfigContents, _, err := nestedContainerRunner.Run("cat /etc/containerd/conf.d/99-nvidia.toml")
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(dropInConfigContents).ToNot(BeEmpty())
 
 					// restart containerd
 					err = restartContainerdAndWait(nestedContainerRunner)
@@ -212,53 +222,64 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					Expect(err).ToNot(HaveOccurred())
 
 					// Parse the TOML output
-					config, err := parseContainerdConfig(output)
+					config, err := toml.Load(output)
 					Expect(err).ToNot(HaveOccurred(), "Failed to parse containerd config")
 
-					// Verify config version
-					version := config.Get("version")
-					Expect(version).To(BeNumerically("==", env.configVersion))
-
-					// Verify imports
-					// Note: containerd config dump behavior differs between versions:
-					// - containerd 1.7: Shows resolved file paths from glob patterns
-					// - containerd 2.x: May show the glob pattern or omit imports entirely
-					if env.configVersion == 2 {
-						// containerd 1.7 shows actual resolved imports
-						err = validateImports(config, []string{"/etc/containerd/conf.d/99-nvidia.toml"}, true)
-						Expect(err).ToNot(HaveOccurred(), "Import validation failed")
+					BeAValidConfig := func(env *containerdTestEnv) types.GomegaMatcher {
+						return And(
+							WithTransform(
+								func(c *toml.Tree) map[string]any {
+									return c.ToMap()
+								},
+								And(
+									HaveKeyWithValue("version", env.configVersion),
+									HaveKeyWithValue("imports", WithTransform(func(is []any) []string {
+										var basePaths []string
+										for _, i := range is {
+											basePaths = append(basePaths, filepath.Dir(i.(string)))
+										}
+										return basePaths
+									},
+										// TODO: We could do better at matching the following:
+										// /etc/containerd/conf.d/99-nvidia.toml
+										// /etc/containerd/conf.d/*.toml
+										ContainElements("/etc/containerd/conf.d"),
+									)),
+								),
+							),
+							WithTransform(
+								// Get the plugins config.
+								func(c *toml.Tree) map[string]any {
+									pt := c.GetPath([]string{"plugins", env.pluginPath})
+									if pt != nil {
+										return pt.(*toml.Tree).ToMap()
+									}
+									return nil
+								},
+								And(
+									HaveKeyWithValue("enable_cdi", true),
+									HaveKeyWithValue("containerd",
+										And(
+											// TODO: This should depend on whether we set the default.
+											HaveKeyWithValue("default_runtime_name", "nvidia"),
+											HaveKeyWithValue("runtimes", HaveKeyWithValue("nvidia",
+												And(
+													HaveKeyWithValue("runtime_type", "io.containerd.runc.v2"),
+													HaveKeyWithValue("options",
+														And(
+															HaveKeyWithValue("BinaryName", "/usr/bin/nvidia-container-runtime"),
+															HaveKeyWithValue("SystemdCgroup", true),
+														),
+													),
+												),
+											)),
+										),
+									),
+								),
+							),
+						)
 					}
-					// For containerd 2.x, imports validation is skipped as the behavior is inconsistent
-
-					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.configVersion)
-					Expect(err).ToNot(HaveOccurred(), "Failed to get plugin config")
-
-					// Verify CDI is enabled
-					cdiEnabled, err := getCDIEnabled(pluginConfig)
-					Expect(err).ToNot(HaveOccurred(), "Failed to get CDI config")
-					Expect(cdiEnabled).To(BeTrue(), "CDI should be enabled")
-
-					// Verify default runtime
-					defaultRuntime, err := getDefaultRuntime(pluginConfig)
-					Expect(err).ToNot(HaveOccurred(), "Failed to get default runtime")
-					Expect(defaultRuntime).To(Equal("nvidia"), "Default runtime should be nvidia")
-
-					// Get runtimes configuration
-					runtimes, err := getRuntimesConfig(pluginConfig)
-					Expect(err).ToNot(HaveOccurred(), "Failed to get runtimes config")
-
-					// Verify NVIDIA runtime exists and is properly configured
-					nvidiaRuntime, exists := runtimes["nvidia"]
-					Expect(exists).To(BeTrue(), "nvidia runtime should exist")
-
-					// Validate nvidia runtime configuration
-					expectedOptions := map[string]interface{}{
-						"BinaryName":    "/usr/bin/nvidia-container-runtime",
-						"SystemdCgroup": true,
-					}
-					err = validateRuntimeConfig(nvidiaRuntime, "", expectedOptions)
-					Expect(err).ToNot(HaveOccurred(), "NVIDIA runtime validation failed")
+					Expect(config).To(BeAValidConfig(&env))
 				})
 			})
 
@@ -275,14 +296,14 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
   [plugins."io.containerd.grpc.v1.cri"]
     [plugins."io.containerd.grpc.v1.cri".containerd]
       default_runtime_name = "kata"
-      
+
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
           runtime_type = "io.containerd.runc.v2"
-          
+
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
           runtime_type = "io.containerd.kata.v2"
-          
+
           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
             ConfigPath = "/etc/kata-containers/configuration.toml"`
 						} else {
@@ -293,14 +314,14 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
   [plugins."io.containerd.cri.v1.runtime"]
     [plugins."io.containerd.cri.v1.runtime".containerd]
       default_runtime_name = "kata"
-      
+
       [plugins."io.containerd.cri.v1.runtime".containerd.runtimes]
         [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
           runtime_type = "io.containerd.runc.v2"
-          
+
         [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
           runtime_type = "io.containerd.kata.v2"
-          
+
           [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
             ConfigPath = "/etc/kata-containers/configuration.toml"`
 						}
@@ -382,11 +403,11 @@ version = 3
   [plugins."io.containerd.cri.v1.runtime"]
     [plugins."io.containerd.cri.v1.runtime".containerd]
       default_runtime_name = "runc"
-      
+
       [plugins."io.containerd.cri.v1.runtime".containerd.runtimes]
         [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
           runtime_type = "io.containerd.runc.v2"
-          
+
           [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
             BinaryName = "/usr/bin/runc"
             SystemdCgroup = true
@@ -577,7 +598,7 @@ func tomlTreeToMap(tree *toml.Tree) map[string]interface{} {
 }
 
 // getPluginConfig navigates to the appropriate plugin configuration based on containerd version
-func getPluginConfig(tree *toml.Tree, version int) (*toml.Tree, error) {
+func getPluginConfig(tree *toml.Tree, version int64) (*toml.Tree, error) {
 	var pluginPath []string
 	if version == 2 {
 		pluginPath = []string{"plugins", "io.containerd.grpc.v1.cri"}
@@ -602,8 +623,18 @@ func getPluginConfig(tree *toml.Tree, version int) (*toml.Tree, error) {
 }
 
 // getRuntimesConfig gets the runtimes configuration from the plugin config
-func getRuntimesConfig(pluginConfig *toml.Tree) (map[string]interface{}, error) {
-	runtimes := pluginConfig.GetPath([]string{"containerd", "runtimes"})
+func getRuntimesConfig(pluginConfig *toml.Tree, _ int64) (map[string]interface{}, error) {
+	containerdSection := pluginConfig.Get("containerd")
+	if containerdSection == nil {
+		return nil, fmt.Errorf("containerd section not found")
+	}
+
+	containerdTree, ok := containerdSection.(*toml.Tree)
+	if !ok {
+		return nil, fmt.Errorf("containerd section is not a TOML tree")
+	}
+
+	runtimes := containerdTree.Get("runtimes")
 	if runtimes == nil {
 		return nil, fmt.Errorf("runtimes section not found")
 	}
