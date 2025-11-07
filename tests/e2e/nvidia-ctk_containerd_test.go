@@ -54,7 +54,7 @@ type containerdTestEnv struct {
 	name          string
 	image         string
 	configVersion int64
-	pluginPath    string
+	pluginName    string
 }
 
 // Define both containerd versions to test
@@ -63,13 +63,13 @@ var containerdEnvs = []containerdTestEnv{
 		name:          "containerd-1.7",
 		image:         "kindest/node:v1.30.0@sha256:047357ac0cfea04663786a612ba1eaba9702bef25227a794b52890dd8bcd692e",
 		configVersion: 2,
-		pluginPath:    "io.containerd.grpc.v1.cri",
+		pluginName:    "io.containerd.grpc.v1.cri",
 	},
 	{
 		name:          "containerd-2.1",
 		image:         "docker.io/kindest/base:v20250521-31a79fd4",
 		configVersion: 3,
-		pluginPath:    "io.containerd.cri.v1.runtime",
+		pluginName:    "io.containerd.cri.v1.runtime",
 	},
 }
 
@@ -239,7 +239,7 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					}
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.pluginPath)
+					pluginConfig, err := getPluginConfig(config, env.pluginName)
 					Expect(err).ToNot(HaveOccurred())
 
 					// Verify CDI is enabled
@@ -397,7 +397,7 @@ EOF
 					config, err := parseContainerdConfig(output)
 					Expect(err).ToNot(HaveOccurred())
 
-					pluginConfig, err := getPluginConfig(config, env.pluginPath)
+					pluginConfig, err := getPluginConfig(config, env.pluginName)
 					Expect(err).ToNot(HaveOccurred())
 
 					runtimes, err := getRuntimesConfig(pluginConfig)
@@ -471,7 +471,7 @@ EOF
 					Expect(config.Get("version")).To(BeNumerically("==", 3), "Config should be version 3")
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.pluginPath)
+					pluginConfig, err := getPluginConfig(config, env.pluginName)
 					Expect(err).ToNot(HaveOccurred(), "Failed to get plugin config")
 
 					// Get runtimes configuration
@@ -583,7 +583,7 @@ EOF
 					}
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.pluginPath)
+					pluginConfig, err := getPluginConfig(config, env.pluginName)
 					Expect(err).ToNot(HaveOccurred(), "Failed to get plugin config")
 
 					// Get runtimes configuration
@@ -766,7 +766,7 @@ func verifyRuntimeConfiguration(runner Runner, env containerdTestEnv, expectedDe
 	config, err := parseContainerdConfig(output)
 	Expect(err).ToNot(HaveOccurred())
 
-	pluginConfig, err := getPluginConfig(config, env.pluginPath)
+	pluginConfig, err := getPluginConfig(config, env.pluginName)
 	Expect(err).ToNot(HaveOccurred())
 
 	// Verify default runtime
