@@ -55,10 +55,12 @@ type containerdTestEnv struct {
 	image         string
 	configVersion int64
 	pluginName    string
+	// TODO: We could read this from the original config.
+	cdiEnabledByDefault bool
 }
 
 // Define both containerd versions to test
-var containerdEnvs = []containerdTestEnv{
+var containerdEnvs = []*containerdTestEnv{
 	{
 		name:          "containerd-1.7",
 		image:         "kindest/node:v1.30.0@sha256:047357ac0cfea04663786a612ba1eaba9702bef25227a794b52890dd8bcd692e",
@@ -70,17 +72,61 @@ var containerdEnvs = []containerdTestEnv{
 		image:         "docker.io/kindest/base:v20250521-31a79fd4",
 		configVersion: 3,
 		pluginName:    "io.containerd.cri.v1.runtime",
+		// containerd >= 2.0 has CDI enabled by default
+		cdiEnabledByDefault: true,
 	},
+}
+
+type toolkitConfig struct {
+	setAsDefault bool
+	cdiEnabled   bool
+}
+
+var toolkitConfigVariants = []*toolkitConfig{
+	{
+		setAsDefault: true,
+		cdiEnabled:   true,
+	},
+	{
+		setAsDefault: false,
+		cdiEnabled:   true,
+	},
+	{
+		setAsDefault: false,
+		cdiEnabled:   false,
+	},
+}
+
+type testConfig struct {
+	*containerdTestEnv
+	*toolkitConfig
+}
+
+func (c *testConfig) name() string {
+	return fmt.Sprintf("%s-default=%v-cdi=%v", c.containerdTestEnv.name, c.setAsDefault, c.cdiEnabled)
 }
 
 // Integration tests for containerd drop-in config functionality
 var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runtime"), func() {
-	// Run all tests for each containerd version
+	// Construct the test configs.
+	var testsConfigs []*testConfig
 	for _, env := range containerdEnvs {
-		Context(env.name, Ordered, func() {
+		for _, variant := range toolkitConfigVariants {
+			config := &testConfig{
+				env,
+				variant,
+			}
+			testsConfigs = append(testsConfigs, config)
+		}
+	}
+
+	// Run all tests for each testConfig
+	for _, tc := range testsConfigs {
+		Context(tc.name(), Ordered, func() {
 			var (
 				nestedContainerRunner Runner
-				containerName         = "nvctk-e2e-containerd-tests-" + env.name
+				// If we want to run these in parallel, we need to us unique names here.
+				containerName = "nvctk-e2e-containerd-tests"
 			)
 
 			// ensureContainerdRunning starts containerd if not running and waits for it to be ready
@@ -121,7 +167,7 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 
 				// Create the nested container with the global cache mounted
 				// TODO: This runner doesn't actually NEED GPU access.
-				nestedContainerRunner, err = NewNestedContainerRunner(runner, env.image, false, containerName, localCacheDir, false)
+				nestedContainerRunner, err = NewNestedContainerRunner(runner, tc.image, false, containerName, localCacheDir, false)
 				Expect(err).ToNot(HaveOccurred())
 
 				// Backup original containerd configuration
@@ -188,16 +234,33 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 			})
 
 			When("configuring containerd", func() {
-				It("should add NVIDIA runtime using drop-in config and merge configurations correctly", func(ctx context.Context) {
-					// Configure containerd using nvidia-ctk
-					_, _, err := nestedContainerRunner.Run(`nvidia-ctk runtime configure --runtime=containerd --set-as-default --cdi.enabled`)
-					Expect(err).ToNot(HaveOccurred(), "Failed to add NVIDIA runtime using drop-in config")
+				BeforeEach(func(ctx context.Context) {
+					// TODO: A sublte difference between this and how the nvidia-container-toolkit-installer works is
+					// that that defaults to command,file for the config source.
+					// We should update that to make this explicit.
+					cmd := []string{"nvidia-ctk runtime configure --runtime=containerd"}
 
+					if tc.setAsDefault {
+						cmd = append(cmd, "--set-as-default")
+					}
+					if tc.cdiEnabled {
+						cmd = append(cmd, "--cdi.enabled")
+					}
+
+					GinkgoLogr.Info("Running", "cmd", cmd)
+					// Configure containerd using nvidia-ctk
+					_, _, err := nestedContainerRunner.Run(strings.Join(cmd, " "))
+					Expect(err).ToNot(HaveOccurred(), "Failed to configure containerd")
+				})
+
+				It("should create a drop-in file", func(ctx context.Context) {
 					// Verify drop-in config was created
 					dropInConfigContents, _, err := nestedContainerRunner.Run("cat /etc/containerd/conf.d/99-nvidia.toml")
 					Expect(err).ToNot(HaveOccurred(), "Drop-in config file was not created")
 					Expect(dropInConfigContents).ToNot(BeEmpty(), "Drop-in config file is empty")
+				})
 
+				It("should ensure that the top-level config has an imports directive", func(ctx context.Context) {
 					// Verify main config has imports directive
 					mainConfigContents, _, err := nestedContainerRunner.Run("cat /etc/containerd/config.toml")
 					Expect(err).ToNot(HaveOccurred(), "Failed to read main config file")
@@ -211,8 +274,11 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					Expect(ok).To(BeTrue(), "Main config imports is not a list")
 					Expect(mainConfigImportsList).To(ContainElement(ContainSubstring("/etc/containerd/conf.d")), "Main config imports does not include conf.d directory")
 
+				})
+
+				It("should create the correct merged config", func(ctx context.Context) {
 					// Restart containerd
-					err = restartContainerdAndWait(nestedContainerRunner)
+					err := restartContainerdAndWait(nestedContainerRunner)
 					Expect(err).ToNot(HaveOccurred(), "Failed to restart containerd to apply merged configuration")
 
 					// Verify merged config structure
@@ -224,7 +290,7 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					Expect(err).ToNot(HaveOccurred(), "Failed to parse merged configuration")
 
 					// Verify config version
-					Expect(config.Get("version")).To(Equal(env.configVersion))
+					Expect(config.Get("version")).To(Equal(tc.configVersion))
 
 					// Verify imports are present in the merged config
 					imports := config.Get("imports")
@@ -232,25 +298,30 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					importsList, ok := imports.([]interface{})
 					Expect(ok).To(BeTrue(), "Merged config imports is not a list")
 					Expect(len(importsList)).To(BeNumerically(">=", 1), "Merged config imports list is empty")
-					if env.configVersion == 2 {
+					if tc.configVersion == 2 {
 						Expect(importsList).To(ContainElement(ContainSubstring("/etc/containerd/conf.d/99-nvidia.toml")), "Merged config imports does not include nvidia drop-in config")
 					} else {
 						Expect(importsList).To(ContainElement(ContainSubstring("/etc/containerd/conf.d/*.toml")), "Merged config imports does not include conf.d directory")
 					}
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.pluginName)
+					pluginConfig, err := getPluginConfig(config, tc.pluginName)
 					Expect(err).ToNot(HaveOccurred())
 
 					// Verify CDI is enabled
 					cdiEnabled, err := getCDIEnabled(pluginConfig)
 					Expect(err).ToNot(HaveOccurred())
-					Expect(cdiEnabled).To(BeTrue())
+					Expect(cdiEnabled).To(BeEquivalentTo(tc.cdiEnabledByDefault || tc.cdiEnabled), fmt.Sprintf("env: %#v config: %#v", tc.containerdTestEnv, tc.toolkitConfig))
 
 					// Verify default runtime
 					defaultRuntime, err := getDefaultRuntime(pluginConfig)
 					Expect(err).ToNot(HaveOccurred())
-					Expect(defaultRuntime).To(Equal("nvidia"))
+					Expect(defaultRuntime).To(Equal(func() string {
+						if tc.setAsDefault {
+							return "nvidia"
+						}
+						return "runc"
+					}()))
 
 					// Verify runtime configuration
 					runtimes, err := getRuntimesConfig(pluginConfig)
@@ -265,87 +336,9 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					})
 					Expect(err).ToNot(HaveOccurred())
 				})
-
-				It("should preserve runc as default when --set-as-default=false", func(ctx context.Context) {
-					// Configure without setting as default
-					_, _, err := nestedContainerRunner.Run(`nvidia-ctk runtime configure --runtime=containerd --set-as-default=false --cdi.enabled`)
-					Expect(err).ToNot(HaveOccurred(), "Failed to configure containerd")
-
-					// Verify drop-in created
-					dropInConfigContents, _, err := nestedContainerRunner.Run("cat /etc/containerd/conf.d/99-nvidia.toml")
-					Expect(err).ToNot(HaveOccurred())
-					Expect(dropInConfigContents).ToNot(BeEmpty())
-
-					// Restart and verify
-					err = restartContainerdAndWait(nestedContainerRunner)
-					Expect(err).ToNot(HaveOccurred())
-
-					// Verify runc is still default
-					expectedRuntimes := map[string]map[string]interface{}{
-						"runc": {
-							"runtime_type": "io.containerd.runc.v2",
-						},
-						"nvidia": {
-							"runtime_type": "",
-							"BinaryName":   "/usr/bin/nvidia-container-runtime",
-						},
-					}
-					verifyRuntimeConfiguration(nestedContainerRunner, env, "runc", expectedRuntimes)
-				})
-
-				It("should set nvidia as default when --set-as-default=true", func(ctx context.Context) {
-					// Configure with nvidia as default
-					_, _, err := nestedContainerRunner.Run(`nvidia-ctk runtime configure --runtime=containerd --set-as-default --cdi.enabled`)
-					Expect(err).ToNot(HaveOccurred(), "Failed to configure containerd")
-
-					// Restart and verify
-					err = restartContainerdAndWait(nestedContainerRunner)
-					Expect(err).ToNot(HaveOccurred())
-
-					// Verify nvidia is default
-					expectedRuntimes := map[string]map[string]interface{}{
-						"runc": {
-							"runtime_type": "io.containerd.runc.v2",
-						},
-						"nvidia": {
-							"runtime_type": "",
-							"BinaryName":   "/usr/bin/nvidia-container-runtime",
-						},
-					}
-					verifyRuntimeConfiguration(nestedContainerRunner, env, "nvidia", expectedRuntimes)
-				})
-
-				It("should add imports directive to main config when missing", func(ctx context.Context) {
-					// Check if imports exist before
-					configBefore, _, err := nestedContainerRunner.Run("cat /etc/containerd/config.toml")
-					Expect(err).ToNot(HaveOccurred())
-					hasImportsBefore := strings.Contains(configBefore, "imports")
-
-					// Configure containerd
-					_, _, err = nestedContainerRunner.Run(`nvidia-ctk runtime configure --runtime=containerd --cdi.enabled`)
-					Expect(err).ToNot(HaveOccurred())
-
-					// Verify main config now has imports
-					configAfter, _, err := nestedContainerRunner.Run("cat /etc/containerd/config.toml")
-					Expect(err).ToNot(HaveOccurred())
-
-					if !hasImportsBefore {
-						Expect(configAfter).To(ContainSubstring("imports"))
-						Expect(configAfter).To(ContainSubstring("/etc/containerd/conf.d"))
-					}
-
-					// Verify imports work by checking config dump includes drop-in content
-					err = restartContainerdAndWait(nestedContainerRunner)
-					Expect(err).ToNot(HaveOccurred())
-
-					output, _, err := nestedContainerRunner.Run(`containerd config dump`)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(output).To(ContainSubstring("nvidia"))
-				})
 			})
-
-		}) // End Context for containerd version
-	} // End for loop over containerd versions
+		})
+	}
 })
 
 // parseContainerdConfig parses the containerd config dump output into a TOML tree
