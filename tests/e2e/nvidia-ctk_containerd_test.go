@@ -239,7 +239,7 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 					}
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.configVersion)
+					pluginConfig, err := getPluginConfig(config, env.pluginPath)
 					Expect(err).ToNot(HaveOccurred())
 
 					// Verify CDI is enabled
@@ -397,7 +397,7 @@ EOF
 					config, err := parseContainerdConfig(output)
 					Expect(err).ToNot(HaveOccurred())
 
-					pluginConfig, err := getPluginConfig(config, env.configVersion)
+					pluginConfig, err := getPluginConfig(config, env.pluginPath)
 					Expect(err).ToNot(HaveOccurred())
 
 					runtimes, err := getRuntimesConfig(pluginConfig)
@@ -471,7 +471,7 @@ EOF
 					Expect(config.Get("version")).To(BeNumerically("==", 3), "Config should be version 3")
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.configVersion)
+					pluginConfig, err := getPluginConfig(config, env.pluginPath)
 					Expect(err).ToNot(HaveOccurred(), "Failed to get plugin config")
 
 					// Get runtimes configuration
@@ -583,7 +583,7 @@ EOF
 					}
 
 					// Get plugin configuration
-					pluginConfig, err := getPluginConfig(config, env.configVersion)
+					pluginConfig, err := getPluginConfig(config, env.pluginPath)
 					Expect(err).ToNot(HaveOccurred(), "Failed to get plugin config")
 
 					// Get runtimes configuration
@@ -610,22 +610,15 @@ func parseContainerdConfig(output string) (*toml.Tree, error) {
 }
 
 // getPluginConfig navigates to the appropriate plugin configuration based on containerd version
-func getPluginConfig(tree *toml.Tree, version int64) (*toml.Tree, error) {
-	var pluginPath []string
-	if version == 2 {
-		pluginPath = []string{"plugins", "io.containerd.grpc.v1.cri"}
-	} else {
-		pluginPath = []string{"plugins", "io.containerd.cri.v1.runtime"}
-	}
-
+func getPluginConfig(tree *toml.Tree, pluginName string) (*toml.Tree, error) {
 	plugins := tree.Get("plugins")
 	if plugins == nil {
 		return nil, fmt.Errorf("plugins section not found")
 	}
 
-	pluginTree := tree.GetPath(pluginPath)
+	pluginTree := tree.GetPath([]string{"plugins", pluginName})
 	if pluginTree == nil {
-		return nil, fmt.Errorf("plugin path %v not found", pluginPath)
+		return nil, fmt.Errorf("plugin %v not found", pluginName)
 	}
 
 	if pt, ok := pluginTree.(*toml.Tree); ok {
@@ -773,7 +766,7 @@ func verifyRuntimeConfiguration(runner Runner, env containerdTestEnv, expectedDe
 	config, err := parseContainerdConfig(output)
 	Expect(err).ToNot(HaveOccurred())
 
-	pluginConfig, err := getPluginConfig(config, env.configVersion)
+	pluginConfig, err := getPluginConfig(config, env.pluginPath)
 	Expect(err).ToNot(HaveOccurred())
 
 	// Verify default runtime
