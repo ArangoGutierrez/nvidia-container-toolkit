@@ -609,21 +609,6 @@ func parseContainerdConfig(output string) (*toml.Tree, error) {
 	return toml.Load(output)
 }
 
-// tomlTreeToMap converts a toml.Tree to a map[string]interface{} recursively
-func tomlTreeToMap(tree *toml.Tree) map[string]interface{} {
-	result := make(map[string]interface{})
-	for _, key := range tree.Keys() {
-		value := tree.Get(key)
-		switch v := value.(type) {
-		case *toml.Tree:
-			result[key] = tomlTreeToMap(v)
-		default:
-			result[key] = v
-		}
-	}
-	return result
-}
-
 // getPluginConfig navigates to the appropriate plugin configuration based on containerd version
 func getPluginConfig(tree *toml.Tree, version int64) (*toml.Tree, error) {
 	var pluginPath []string
@@ -661,7 +646,7 @@ func getRuntimesConfig(pluginConfig *toml.Tree) (map[string]interface{}, error) 
 	case map[string]interface{}:
 		return v, nil
 	case *toml.Tree:
-		return tomlTreeToMap(v), nil
+		return v.ToMap(), nil
 	default:
 		return nil, fmt.Errorf("runtimes is not a map or toml.Tree, got %T", runtimes)
 	}
