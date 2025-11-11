@@ -127,9 +127,11 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 	for _, tc := range testsConfigs {
 		Context(tc.name(), Ordered, func() {
 			var (
-				nestedContainerRunner Runner
-				containerName         = "nvctk-e2e-containerd-tests"
-				baselineConfig        *toml.Tree
+				nestedContainerRunner  Runner
+				containerName          = "nvctk-e2e-containerd-tests"
+				baselineConfig         *toml.Tree
+				baselineConfigPlugins  *toml.Tree
+				baselineConfigRuntimes map[string]any
 			)
 
 			// restartContainerdAndWait restarts containerd and waits for it
@@ -176,8 +178,15 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 				baselineOutput, _, err := nestedContainerRunner.Run("containerd config dump")
 				Expect(err).ToNot(HaveOccurred(), "Failed to dump baseline configuration")
 
-				baselineConfig, err = parseContainerdConfig(baselineOutput)
+				baselineConfig, err = toml.Load(baselineOutput)
 				Expect(err).ToNot(HaveOccurred(), "Failed to parse baseline configuration")
+
+				// Get plugin configs for comparison
+				baselineConfigPlugins, err = getPluginConfig(baselineConfig, tc.pluginName)
+				Expect(err).ToNot(HaveOccurred())
+
+				baselineConfigRuntimes, err = getRuntimesConfig(baselineConfigPlugins)
+				Expect(err).ToNot(HaveOccurred())
 
 				// Install the NVIDIA Container Toolkit packages
 				_, _, err = toolkitInstaller.Install(nestedContainerRunner)
@@ -192,183 +201,182 @@ var _ = Describe("containerd", Ordered, ContinueOnFailure, Label("container-runt
 				}
 			})
 
-			It("should preserve existing configuration and apply only expected changes", func(ctx context.Context) {
-				// Apply nvidia-ctk configuration
-				cmd := []string{"nvidia-ctk runtime configure --runtime=containerd"}
+			When("configuring containerd", func() {
+				var (
+					mergedConfig         *toml.Tree
+					mergedConfigPlugins  *toml.Tree
+					mergedConfigRuntimes map[string]any
+				)
 
-				if tc.setAsDefault {
-					cmd = append(cmd, "--set-as-default")
-				}
-				if tc.cdiEnabled {
-					cmd = append(cmd, "--cdi.enabled")
-				}
+				BeforeAll(func(ctx context.Context) {
+					// Apply nvidia-ctk configuration
+					cmd := []string{"nvidia-ctk runtime configure --runtime=containerd"}
 
-				GinkgoLogr.Info("Applying nvidia-ctk configuration", "cmd", strings.Join(cmd, " "))
-				_, _, err := nestedContainerRunner.Run(strings.Join(cmd, " "))
-				Expect(err).ToNot(HaveOccurred(), "Failed to configure containerd")
+					if tc.setAsDefault {
+						cmd = append(cmd, "--set-as-default")
+					}
+					if tc.cdiEnabled {
+						cmd = append(cmd, "--cdi.enabled")
+					}
 
-				// Restart containerd to apply merged configuration
-				err = restartContainerdAndWait(nestedContainerRunner)
-				Expect(err).ToNot(HaveOccurred(), "Failed to restart containerd")
+					GinkgoLogr.Info("Applying nvidia-ctk configuration", "cmd", strings.Join(cmd, " "))
+					_, _, err := nestedContainerRunner.Run(strings.Join(cmd, " "))
+					Expect(err).ToNot(HaveOccurred(), "Failed to configure containerd")
 
-				// Get merged configuration
-				mergedOutput, _, err := nestedContainerRunner.Run("containerd config dump")
-				Expect(err).ToNot(HaveOccurred(), "Failed to dump merged configuration")
+					// Restart containerd to apply merged configuration
+					err = restartContainerdAndWait(nestedContainerRunner)
+					Expect(err).ToNot(HaveOccurred(), "Failed to restart containerd")
 
-				mergedConfig, err := parseContainerdConfig(mergedOutput)
-				Expect(err).ToNot(HaveOccurred(), "Failed to parse merged configuration")
+					// Get merged configuration
+					mergedOutput, _, err := nestedContainerRunner.Run("containerd config dump")
+					Expect(err).ToNot(HaveOccurred(), "Failed to dump merged configuration")
 
-				// VALIDATE PRESERVATION
-				err = validateConfigPreservation(baselineConfig, mergedConfig, tc)
-				Expect(err).ToNot(HaveOccurred())
+					mergedConfig, err = toml.Load(mergedOutput)
+					Expect(err).ToNot(HaveOccurred(), "Failed to parse merged configuration")
+
+					mergedConfigPlugins, err = getPluginConfig(mergedConfig, tc.pluginName)
+					Expect(err).ToNot(HaveOccurred())
+
+					mergedConfigRuntimes, err = getRuntimesConfig(mergedConfigPlugins)
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				It("existing runtimes should remain unchanged", func(ctx context.Context) {
+					for runtimeName, runtimeConfig := range baselineConfigRuntimes {
+						Expect(mergedConfigRuntimes).To(HaveKeyWithValue(runtimeName, runtimeConfig))
+					}
+				})
+
+				It("the nvidia runtime should be added with the correct options", func(ctx context.Context) {
+					runcToml, err := toml.TreeFromMap(baselineConfigRuntimes["runc"].(map[string]any))
+					Expect(err).ToNot(HaveOccurred())
+
+					runcTomlString, err := runcToml.ToTomlString()
+					Expect(err).ToNot(HaveOccurred())
+
+					var addedRuntimes []string
+					for runtimeName, runtimeConfig := range mergedConfigRuntimes {
+						if _, ok := baselineConfigRuntimes[runtimeName]; ok {
+							continue
+						}
+						addedRuntimes = append(addedRuntimes, runtimeName)
+
+						Expect(runtimeConfig).To(
+							HaveKeyWithValue(
+								"options", HaveKeyWithValue("BinaryName", "/usr/bin/nvidia-container-runtime"),
+							),
+						)
+
+						runtimeToml, err := toml.TreeFromMap(runtimeConfig.(map[string]any))
+						Expect(err).ToNot(HaveOccurred())
+
+						// TODO: for some reason the podsandboxer is set to "" in the updated config
+						// but set to a valid string in the runc config. This is most likely due to
+						// the config source that we're implicitly using.
+						if runcSandboxer := runcToml.Get("sandboxer"); runcSandboxer != nil {
+							runtimeToml.Set("sandboxer", runcSandboxer)
+						}
+
+						runcPath := runcToml.GetPath([]string{"options", "BinaryName"})
+						if runcPath == nil {
+							runtimeToml.DeletePath([]string{"options", "BinaryName"})
+						}
+
+						for _, option := range runcToml.Get("options").(*toml.Tree).Keys() {
+							runcOption := runcToml.GetPath([]string{"options", option})
+							switch v := runcOption.(type) {
+							case int64:
+								if runcOption.(int64) != 0 {
+									GinkgoLogr.Info(fmt.Sprintf("non-zero option for %v: %+v %T", option, runcOption, v))
+									continue
+								}
+							case string:
+								if runcOption.(string) != "" {
+									GinkgoLogr.Info(fmt.Sprintf("non-zero option for %v: %+v %T", option, runcOption, v))
+									continue
+								}
+							case bool:
+								if runcOption.(bool) {
+									GinkgoLogr.Info(fmt.Sprintf("non-zero option for %v: %+v %T", option, runcOption, v))
+									continue
+								}
+							default:
+								panic(fmt.Sprintf("invalid type for option %v: %+v %T", option, runcOption, v))
+							}
+							runtimeToml.SetPath([]string{"options", option}, runcOption)
+						}
+
+						Expect(runtimeToml.ToTomlString()).To(BeEquivalentTo(runcTomlString))
+					}
+
+					Expect(addedRuntimes).To(Equal([]string{"nvidia"}))
+				})
+
+				It("should set the default runtime", func(ctx context.Context) {
+					expectedDefault := "runc"
+					if tc.setAsDefault {
+						expectedDefault = "nvidia"
+					}
+					Expect(mergedConfigPlugins).To(
+						WithTransform(
+							func(t *toml.Tree) any {
+								return t.GetPath([]string{"containerd", "default_runtime_name"})
+							},
+							BeEquivalentTo(expectedDefault),
+						),
+					)
+				})
+
+				It("should set cdi_enabled as expected", func(ctx context.Context) {
+					Expect(mergedConfigPlugins).To(
+						WithTransform(
+							func(t *toml.Tree) any {
+								return t.GetPath([]string{"enable_cdi"})
+							},
+							BeEquivalentTo(tc.cdiEnabledByDefault || tc.cdiEnabled),
+						),
+					)
+				})
+
+				It("should update the imports as expected", func(ctx context.Context) {
+					Expect(mergedConfig).To(
+						WithTransform(
+							func(t *toml.Tree) any {
+								return t.Get("imports")
+							},
+							ContainElement(HavePrefix("/etc/containerd/conf.d/")),
+						),
+					)
+				})
+
+				It("should preserve the other config options", func(ctx context.Context) {
+					strippedMergedConfig, err := toml.TreeFromMap(mergedConfig.ToMap())
+					Expect(err).ToNot(HaveOccurred())
+
+					// We remove the nvidia runtime that was added.
+					strippedMergedConfig.DeletePath([]string{"plugins", tc.pluginName, "containerd", "runtimes", "nvidia"})
+					// We update the settings that we expect to change.
+					for _, p := range [][]string{
+						{"plugins", tc.pluginName, "containerd", "default_runtime_name"},
+						{"plugins", tc.pluginName, "enable_cdi"},
+						{"imports"},
+					} {
+						strippedMergedConfig.SetPath(p, baselineConfig.GetPath(p))
+					}
+
+					Expect(strippedMergedConfig.ToTomlString()).To(BeEquivalentTo(func() string {
+						s, _ := baselineConfig.ToTomlString()
+						return s
+					}()))
+				})
 			})
 		})
 	}
 })
 
-// validateConfigPreservation checks that existing config is preserved
-// and only expected changes are made
-func validateConfigPreservation(baseline, merged *toml.Tree, tc *testConfig) error {
-	// Get plugin configs for comparison
-	baselinePlugin, err := getPluginConfig(baseline, tc.pluginName)
-	if err != nil {
-		return fmt.Errorf("failed to get baseline plugin config: %w", err)
-	}
-
-	mergedPlugin, err := getPluginConfig(merged, tc.pluginName)
-	if err != nil {
-		return fmt.Errorf("failed to get merged plugin config: %w", err)
-	}
-
-	// Get runtimes configuration from both baseline and merged configs
-	baselineRuntimes, err := getRuntimesConfig(baselinePlugin)
-	if err != nil {
-		return fmt.Errorf("failed to get baseline runtimes: %w", err)
-	}
-
-	mergedRuntimes, err := getRuntimesConfig(mergedPlugin)
-	if err != nil {
-		return fmt.Errorf("failed to get merged runtimes: %w", err)
-	}
-
-	// Check 1: Verify runc runtime is preserved (if it existed in baseline)
-	runcInBaseline := false
-	if _, exists := baselineRuntimes["runc"]; exists {
-		runcInBaseline = true
-	}
-
-	// If runc was in baseline, it must still exist in merged
-	if runcInBaseline {
-		if _, exists := mergedRuntimes["runc"]; !exists {
-			return fmt.Errorf("runc runtime was removed from configuration (regression: commit 598c632 logic broken for containerd plugin merge) - this typically affects containerd < 2.1")
-		}
-	}
-
-	// Check 2: Verify all other baseline runtimes are preserved
-	for runtimeName := range baselineRuntimes {
-		if runtimeName == "nvidia" {
-			continue // nvidia is expected to be added, so skip
-		}
-		if _, exists := mergedRuntimes[runtimeName]; !exists {
-			return fmt.Errorf("runtime %q was removed from configuration - check if CRI plugin section is being properly preserved in drop-in file", runtimeName)
-		}
-	}
-
-	// Check 3: NVIDIA runtime must be added
-	nvidiaRuntime, exists := mergedRuntimes["nvidia"]
-	if !exists {
-		return fmt.Errorf("nvidia runtime was not added")
-	}
-
-	nvidiaRuntimeMap, ok := nvidiaRuntime.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("nvidia runtime is not a map[string]interface{}, got %T", nvidiaRuntime)
-	}
-
-	// Validate nvidia runtime structure
-	if err := validateRuntimeConfig(nvidiaRuntimeMap, "io.containerd.runc.v2", map[string]interface{}{
-		"BinaryName":    "/usr/bin/nvidia-container-runtime",
-		"SystemdCgroup": true,
-	}); err != nil {
-		return fmt.Errorf("nvidia runtime config invalid: %w", err)
-	}
-
-	// Check 4: Verify expected state changes
-	defaultRuntime, _ := getDefaultRuntime(mergedPlugin)
-	expectedDefault := "runc"
-	if tc.setAsDefault {
-		expectedDefault = "nvidia"
-	}
-	// Only validate if a default runtime is set
-	if defaultRuntime != "" && defaultRuntime != expectedDefault {
-		return fmt.Errorf("default_runtime_name: expected %q, got %q", expectedDefault, defaultRuntime)
-	}
-
-	cdiEnabled, _ := getCDIEnabled(mergedPlugin)
-	expectedCDI := tc.cdiEnabledByDefault || tc.cdiEnabled
-	if cdiEnabled != expectedCDI {
-		return fmt.Errorf("enable_cdi: expected %v, got %v", expectedCDI, cdiEnabled)
-	}
-
-	// Check 5: Verify important CRI plugin settings are preserved
-	// (snapshotter, registry mirrors, etc. - if they existed in baseline)
-	if err := validateCRIPluginSettingsPreserved(baselinePlugin, mergedPlugin); err != nil {
-		return fmt.Errorf("CRI plugin settings not preserved: %w", err)
-	}
-
-	return nil
-}
-
-// validateCRIPluginSettingsPreserved checks that key CRI plugin settings
-// are preserved from baseline to merged config. This is especially important
-// for containerd < 2.1 where plugins are merged by key rather than by
-// content (see https://github.com/containerd/containerd/issues/5837).
-func validateCRIPluginSettingsPreserved(baseline, merged *toml.Tree) error {
-	// Check snapshotter setting
-	baselineSnapshotter := baseline.GetPath([]string{"containerd", "snapshotter"})
-	mergedSnapshotter := merged.GetPath([]string{"containerd", "snapshotter"})
-
-	if baselineSnapshotter != nil && baselineSnapshotter != mergedSnapshotter {
-		return fmt.Errorf("snapshotter changed: %v -> %v", baselineSnapshotter, mergedSnapshotter)
-	}
-
-	// Check registry configuration exists if it existed in baseline
-	baselineRegistry := baseline.Get("registry")
-	if baselineRegistry != nil {
-		mergedRegistry := merged.Get("registry")
-		if mergedRegistry == nil {
-			return fmt.Errorf("registry configuration was removed")
-		}
-		// Note: We don't deep-compare registry config as containerd may
-		// normalize it, but at least the section should exist
-	}
-
-	// Check CNI configuration exists if it existed in baseline
-	baselineCNI := baseline.Get("cni")
-	if baselineCNI != nil {
-		mergedCNI := merged.Get("cni")
-		if mergedCNI == nil {
-			return fmt.Errorf("cni configuration was removed")
-		}
-	}
-
-	return nil
-}
-
-// parseContainerdConfig parses the containerd config dump output into a TOML
-// tree
-func parseContainerdConfig(output string) (*toml.Tree, error) {
-	return toml.Load(output)
-}
-
 // getPluginConfig navigates to the appropriate plugin configuration based on
 // containerd version
 func getPluginConfig(tree *toml.Tree, pluginName string) (*toml.Tree, error) {
-	plugins := tree.Get("plugins")
-	if plugins == nil {
-		return nil, fmt.Errorf("plugins section not found")
-	}
-
 	pluginTree := tree.GetPath([]string{"plugins", pluginName})
 	if pluginTree == nil {
 		return nil, fmt.Errorf("plugin %v not found", pluginName)
@@ -396,69 +404,4 @@ func getRuntimesConfig(pluginConfig *toml.Tree) (map[string]interface{}, error) 
 	default:
 		return nil, fmt.Errorf("runtimes is not a map or toml.Tree, got %T", runtimes)
 	}
-}
-
-// getCDIEnabled checks if CDI is enabled in the plugin configuration
-func getCDIEnabled(pluginConfig *toml.Tree) (bool, error) {
-	cdiEnabled := pluginConfig.Get("enable_cdi")
-	if cdiEnabled == nil {
-		return false, nil // CDI not configured, default is false
-	}
-
-	if enabled, ok := cdiEnabled.(bool); ok {
-		return enabled, nil
-	}
-
-	return false, fmt.Errorf("enable_cdi is not a boolean")
-}
-
-// getDefaultRuntime gets the default runtime name from the containerd
-// configuration
-func getDefaultRuntime(pluginConfig *toml.Tree) (string, error) {
-	defaultRuntime := pluginConfig.GetPath([]string{"containerd", "default_runtime_name"})
-	if defaultRuntime == nil {
-		return "", nil // No default runtime set
-	}
-
-	if runtime, ok := defaultRuntime.(string); ok {
-		return runtime, nil
-	}
-
-	return "", fmt.Errorf("default_runtime_name is not a string")
-}
-
-// validateRuntimeConfig validates a specific runtime configuration
-func validateRuntimeConfig(runtime map[string]interface{}, expectedType string, expectedOptions map[string]interface{}) error {
-	// Check runtime type only if expectedType is specified
-	if expectedType != "" {
-		runtimeType, ok := runtime["runtime_type"].(string)
-		if !ok {
-			return fmt.Errorf("runtime_type not found or not a string")
-		}
-		if runtimeType != expectedType {
-			return fmt.Errorf("expected runtime_type %s, got %s", expectedType, runtimeType)
-		}
-	}
-
-	// Check options if provided
-	if len(expectedOptions) > 0 {
-		options, ok := runtime["options"].(map[string]interface{})
-		if !ok {
-			return fmt.Errorf("options not found or not a map[string]interface{}")
-		}
-
-		// Use gomega matchers for validation
-		for key, expectedValue := range expectedOptions {
-			matcher := HaveKeyWithValue(key, expectedValue)
-			success, err := matcher.Match(options)
-			if err != nil {
-				return fmt.Errorf("error matching option %s: %v", key, err)
-			}
-			if !success {
-				return fmt.Errorf("option validation failed: %s", matcher.FailureMessage(options))
-			}
-		}
-	}
-
-	return nil
 }
